@@ -19,33 +19,96 @@ except Exception:
     DB_PATH = Path("data/cq.db")
     JSONL_PATH = Path("data/questions.jsonl")
 
+# -*- coding: utf-8 -*-
+
+# -------------------------------
+# 起動前セットアップ：DBが無ければJSONLから自動生成＋スキーマ検証
+# -------------------------------
+from pathlib import Path
+import os
+import sqlite3
+
+# import_jsonl は両対応（app.services / services）
+try:
+    from app.services import import_jsonl as _imp
+except Exception:
+    from services import import_jsonl as _imp  # 旧構成向け
+
+# DB/JSONL パスも両対応
+try:
+    from app.services.config import DB_PATH, JSONL_PATH
+except Exception:
+    DB_PATH = Path("data/cq.db")
+    JSONL_PATH = Path("data/questions.jsonl")
+
+REQUIRED_MIN_COLS = {"id", "skill", "level", "type", "prompt", "answer_key", "difficulty"}
+
+def _current_cols(db_path: Path) -> set:
+    if not db_path.exists():
+        return set()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='questions'")
+            if not cur.fetchone():
+                return set()
+            cur.execute("PRAGMA table_info(questions)")
+            return {row[1] for row in cur.fetchall()}  # row[1] = column name
+    except Exception:
+        return set()
+
+def _schema_is_valid(db_path: Path) -> bool:
+    cols = _current_cols(db_path)
+    return bool(cols) and REQUIRED_MIN_COLS.issubset(cols)
+
+def _run_import(jsonl: Path, db: Path):
+    # import_jsonl の関数名が run / import_jsonl どちらでも動くように
+    if hasattr(_imp, "run"):
+        _imp.run(str(jsonl), str(db))
+    elif hasattr(_imp, "import_jsonl"):
+        _imp.import_jsonl()
+    else:
+        raise RuntimeError("import_jsonl.py に run() も import_jsonl() も見つかりません。")
+
 def _ensure_db():
-    """DBが無い/空/古い場合に JSONL→DB を実行する"""
+    """DB が無い / 壊れている / スキーマが古い ときに JSONL→DB を実行"""
     jsonl = Path(JSONL_PATH)
     db = Path(DB_PATH)
 
     need = False
-    if not db.exists():
+
+    # 1) 物理的に無い/小さすぎる → 作成
+    if (not db.exists()) or (db.stat().st_size < 1024):
         need = True
-    else:
+
+    # 2) スキーマ検証（必須列が無ければ再作成）
+    if not need and not _schema_is_valid(db):
+        need = True
+
+    # 3) JSONL の方が新しければ再作成
+    if not need:
         try:
-            # JSONLがDBより新しければ再インポート
-            need = jsonl.exists() and jsonl.stat().st_mtime > db.stat().st_mtime
-            # 破損/空DB（極小サイズ）のときも念のため再作成
-            if db.stat().st_size < 1024:
+            if jsonl.exists() and jsonl.stat().st_mtime > db.stat().st_mtime:
                 need = True
         except Exception:
             need = True
 
+    # 4) 環境変数で強制再作成（必要時）
+    if os.getenv("CQ_REBUILD_DB", "0") == "1":
+        need = True
+
     if need:
-        if hasattr(_imp, "run"):
-            _imp.run(str(jsonl), str(db))
-        elif hasattr(_imp, "import_jsonl"):
-            _imp.import_jsonl()
-        else:
-            raise RuntimeError("import_jsonl.py に run() も import_jsonl() も見つかりません。")
+        # 既存があれば削除してクリーンに再生成（スキーマ確実化）
+        try:
+            if db.exists():
+                db.unlink()
+        except Exception:
+            pass
+        _run_import(jsonl, db)
 
 _ensure_db()
+# =============================== ここからUI ===============================
+
 
 # =============================== ここからUI ===============================
 
