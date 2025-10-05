@@ -1,6 +1,42 @@
 import streamlit as st
 import sys, os
 from typing import List, Set
+# streamlit_app_cq.py の先頭付近に追加
+import time, subprocess
+import os
+DEBUG = os.getenv("CQ_DEBUG", "0") == "1"
+
+# タイトルの直後などに一度だけ
+st.markdown("""
+<style>
+/* 全体の文字を黒にする（Streamlitはデフォで#444〜#555） */
+.stMarkdown p, .stMarkdown blockquote, .stMarkdown li, .stMarkdown span {
+    color: #000000 !important;
+}
+
+/* 引用ブロック（> A: など）を黒文字＆見やすく調整 */
+blockquote {
+    font-size: 1.05rem;
+    line-height: 1.8;
+    color: #000000 !important;
+    margin: 0.2rem 0 0.8rem 0;
+    border-left: 4px solid #ccc;
+    padding-left: 0.8rem;
+    background-color: #fafafa;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+def _maybe_reimport():
+    jsonl = os.path.join("data","questions.jsonl")
+    db = os.path.join("app","services","questions.sqlite3")
+    if not os.path.exists(db) or (os.path.getmtime(jsonl) > os.path.getmtime(db)):
+        script = os.path.join("app","services","import_jsonl.py")
+        subprocess.run([sys.executable, script], check=False)
+
+_maybe_reimport()
+
 
 # --- パス設定 ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -13,42 +49,47 @@ from services.ai_eval import eval_free_response  # 自由記述のAI評価
 st.set_page_config(page_title="CQ App (MVP)", page_icon="🎧", layout="centered")
 
 st.title("🎧 CQ アプリ（MVP）")
-st.caption("各カテゴリ：2問ずつ出題。状況判断は選択別フィードバック＋自由記述AI評価。")
 
 # -------------------------------
-# ヘルパー
+# ★ 修正箇所①：ドメイン定義を厳格化
 # -------------------------------
 def domain_tagset(domain_label: str) -> Set[str]:
-    """ドメイン選択に応じた優先タグ集合"""
     if domain_label == "ビジネス":
-        return {"workplace", "meeting", "team", "business", "office", "review", "deadline", "decision"}
-    else:  # 日常
+        return {"business", "workplace", "meeting", "team", "office", "review", "deadline", "decision"}
+    else:
         return {"daily", "日常", "friend", "family", "生活", "home", "communication"}
 
-def filter_by_domain(qs, domain_label: str):
-    """タグ一致を優先、足りなければ全体から補充"""
+# -------------------------------
+# ★ 修正箇所②：厳格フィルタ（越境補充をやめる）
+# -------------------------------
+def filter_by_domain_strict(qs, domain_label: str, want: int) -> List:
     pref = domain_tagset(domain_label)
     matched = [q for q in qs if any(t in pref for t in (q.tags or []))]
-    if len(matched) >= 2:
-        return matched
-    # 不足ぶんは全体から埋める
-    seen_ids = {q.id for q in matched}
-    for q in qs:
-        if len(matched) >= 2:
-            break
-        if q.id not in seen_ids:
-            matched.append(q)
-            seen_ids.add(q.id)
-    return matched
+    return matched[:want]
 
 def render_prompt_block(text: str):
-    """会話や長文を読みやすく描画（引用・強制改行）"""
-    # Markdownの改行は "  \n" が必要。各行を引用に。
-    lines = [ln.strip() for ln in (text or "").split("\n")]
+    """会話や長文を読みやすく描画（引用＋改行維持。HTMLラップしない）"""
+    if not text:
+        return
+
+    # 「 A:」「 B:」「 C:」の直前に空行を入れる（視認性UP）
+    text = (text
+            .replace(" A:", "\n\nA:")
+            .replace(" B:", "\n\nB:")
+            .replace(" C:", "\n\nC:"))
+
+    # Markdownで改行を維持するため行末に半角スペース2つ
+    lines = [ln.rstrip() + "  " for ln in text.split("\n")]
     body = "\n".join([f"> {ln}" if ln else ">" for ln in lines])
+
     with st.container(border=True):
-        st.markdown("**設問（本文）**")
+        st.markdown("#### 🗣️ 設問（本文）")
+        # ここは純Markdownで描画（HTMLラップしない）
         st.markdown(body)
+
+
+
+
 
 def clear_answer_widgets():
     for k in list(st.session_state.keys()):
@@ -59,15 +100,9 @@ def clear_answer_widgets():
 # -------------------------------
 # 上部UI：アプリ説明
 # -------------------------------
-col1, col2 = st.columns([1, 1])
-with col1:
-    show_info = st.button("このアプリの説明", use_container_width=True)
-with col2:
-    pass  # 余白
-
-if show_info:
-    st.info(
-        "このアプリは **文脈理解力（CQ: Context Quotient）** を鍛えるためのアプリの試作版です。\n\n"
+with st.expander("このアプリの説明", expanded=False):
+    st.markdown(
+        "このアプリは **文脈理解力（CQ: Context Quotient）** を鍛えるアプリの試作版です。\n\n"
         "【使い方】\n"
         "1) ドメイン（ビジネス／日常）とカテゴリを選ぶ → 2問が出題されます。\n"
         "2) 選択式のカテゴリは「採点する」で正誤と解説を確認できます。\n"
@@ -104,45 +139,38 @@ if "batch_no" not in st.session_state:
 if "_last_loaded_batch_no" not in st.session_state:
     st.session_state._last_loaded_batch_no = -1
 
+# -------------------------------
+# ★ 修正箇所③：get_new_batchの改訂版
+# -------------------------------
 def get_new_batch(_skill: str, _domain: str, want: int = 2):
     is_sjt = (_skill == "状況判断")
     picked = []
 
-    # 多めに引いてからドメインで絞る→未出題で詰める
-    candidates = load_questions(skill_filter=_skill, limit=30)
+    candidates = load_questions(skill_filter=_skill, limit=200)
     if is_sjt:
         candidates = [q for q in candidates if q.type == "sjt"]
     else:
         candidates = [q for q in candidates if q.type != "sjt"]
 
-    # ドメイン優先
-    candidates = filter_by_domain(candidates, _domain)
+    domain_candidates = filter_by_domain_strict(candidates, _domain, want=want)
 
-    # 未出題のみ
-    for q in candidates:
+    for q in domain_candidates:
         if len(picked) >= want:
             break
         if q.id not in st.session_state.seen_ids:
             picked.append(q)
             st.session_state.seen_ids.add(q.id)
 
-    # それでも不足なら全体から補充
     if len(picked) < want:
-        fallback = load_questions(skill_filter=_skill, limit=30)
-        if is_sjt:
-            fallback = [q for q in fallback if q.type == "sjt"]
-        else:
-            fallback = [q for q in fallback if q.type != "sjt"]
-        for q in fallback:
-            if len(picked) >= want:
-                break
-            if q.id not in st.session_state.seen_ids:
-                picked.append(q)
-                st.session_state.seen_ids.add(q.id)
-
+        st.warning(
+            f"{_domain}×{_skill} の登録問題が不足しています（{len(picked)}/{want}）。"
+            " `data/questions.jsonl` に追加して import してください。"
+        )
     return picked
 
-# スキル or ドメインが変わったらリセットして最初の2問
+# -------------------------------
+# スキル or ドメイン変更検知
+# -------------------------------
 if (st.session_state.current_skill != skill) or (st.session_state.current_domain != domain):
     st.session_state.current_skill = skill
     st.session_state.current_domain = domain
@@ -151,20 +179,28 @@ if (st.session_state.current_skill != skill) or (st.session_state.current_domain
     st.session_state._last_loaded_batch_no = -1
     clear_answer_widgets()
 
-# バッチが未ロードならロード
+# -------------------------------
+# バッチロード
+# -------------------------------
 if st.session_state._last_loaded_batch_no != st.session_state.batch_no:
     clear_answer_widgets()
     qs = get_new_batch(skill, domain, want=2)
     st.session_state.fixed_questions = qs
     st.session_state._last_loaded_batch_no = st.session_state.batch_no
 
-# 以後は固定した問題を使う
 questions = st.session_state.fixed_questions
 
 if not questions:
     st.warning("この条件での登録問題が不足しています。`data/questions.jsonl` に追記して import してください。")
     st.stop()
 
+# -------------------------------
+# ★ 修正箇所④：デバッグ表示（削除可）
+# -------------------------------
+if DEBUG:
+    st.caption(f"DEBUG domain={domain}")
+    if questions:
+        st.caption(f"DEBUG first.tags={questions[0].tags}")
 st.divider()
 st.subheader(f"出題：{domain} × {skill}（{len(questions)}問）")
 
@@ -174,7 +210,7 @@ st.subheader(f"出題：{domain} × {skill}（{len(questions)}問）")
 answers = []
 for i, q in enumerate(questions, start=1):
     st.markdown(f"**Q{i}.**")
-    render_prompt_block(q.prompt)  # ← 読みやすく表示
+    render_prompt_block(q.prompt)
 
     opts = ["A", "B", "C", "D"][:len(q.choices) if q.choices else 0]
 
@@ -193,7 +229,6 @@ for i, q in enumerate(questions, start=1):
     )
     answers.append(key)
 
-    # SJTのみ：自由記述欄
     if skill == "状況判断":
         st.text_area(
             "自由記述（任意）: あなたならどう対応しますか？",
@@ -210,20 +245,14 @@ for i, q in enumerate(questions, start=1):
 is_sjt_mode = (skill == "状況判断")
 
 if is_sjt_mode:
-    # SJT: 正誤なし＋自由記述AI評価
     if st.button("フィードバックを見る", type="primary", use_container_width=True):
         feedbacks = grade_sjt(questions, answers)
-
         for i, (q, fb) in enumerate(zip(questions, feedbacks), start=1):
             st.markdown(f"### Q{i}")
-
             with st.container(border=True):
                 st.markdown("**シナリオ（再掲）**")
-                # 同じ描画関数を再利用
                 render_prompt_block(q.prompt)
-
             st.markdown(f"**あなたの選択:** 🟢 {fb['chosen'] or '—'}")
-
             st.markdown("#### 各選択肢の解説")
             for key in ["A", "B", "C", "D"]:
                 if q.feedbacks and key in q.feedbacks:
@@ -233,8 +262,6 @@ if is_sjt_mode:
                         st.markdown(f"**👉 {line}**")
                     else:
                         st.markdown(line)
-
-            # 自由記述のAI評価（任意）
             user_free = (st.session_state.get(f"free_{q.id}") or "").strip()
             if user_free:
                 ai = eval_free_response(q.prompt, user_free)
@@ -249,17 +276,12 @@ if is_sjt_mode:
                 )
                 st.write(f"- 要点指摘: {ai.get('short_feedback', '—')}")
                 st.write(f"- 次ドリル: {ai.get('next_drill', '—')}")
-
             st.markdown("---")
-
-        st.info("※ 状況判断は“正解/不正解”を出さず、各選択肢の文脈解説と自由記述のAI評価（任意）を提示します。")
-
+        st.info("※ 状況判断は正誤を出さず、各選択肢の解説と自由記述AI評価を提示します。")
 else:
-    # MCQ: 採点＋正誤・根拠（選択肢別の解説一覧）
     if st.button("採点する", type="primary", use_container_width=True):
         results, correct, total = grade_mcq(questions, answers)
         st.success(f"スコア：{correct} / {total}（{round(100 * correct / total)} 点）")
-
         with st.expander("各問の解説・正答"):
             for i, r in enumerate(results, start=1):
                 st.markdown(
@@ -267,7 +289,6 @@ else:
                 )
                 st.write(f"- あなたの選択: {r.chosen or '—'}")
                 st.write(f"- 正答: {r.correct_key or '—'}")
-
                 q = questions[i - 1]
                 st.markdown("**解説（選択肢別）**")
                 ex_dict = q.explanations or {}
@@ -280,13 +301,11 @@ else:
                         else:
                             st.markdown(line)
                         rendered_any = True
-
                 if not rendered_any:
                     if r.explanation:
                         st.write(f"- 根拠: {r.explanation}")
                     else:
                         st.write("（この問題には解説が登録されていません）")
-
                 st.markdown("---")
 
 # -------------------------------

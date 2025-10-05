@@ -1,9 +1,9 @@
-import json, sqlite3
+import json
+import sqlite3
 from pathlib import Path
 from typing import List, Optional
 from app.domain.models import Question
-
-DB_PATH = Path("data/cq.db")
+from app.services.config import DB_PATH  # ← 統一管理
 
 def _rows_to_questions(rows) -> List[Question]:
     out: List[Question] = []
@@ -19,11 +19,12 @@ def _rows_to_questions(rows) -> List[Question]:
             explanations=json.loads(r[7]) if r[7] else {},
             difficulty=r[8] if r[8] is not None else 0.5,
             tags=json.loads(r[9]) if r[9] else [],
-            feedbacks=json.loads(r[10]) if len(r) > 10 and r[10] else None  # ★ 追加
+            feedbacks=json.loads(r[10]) if len(r) > 10 and r[10] else None
         ))
     return out
 
 def load_questions(skill_filter: Optional[str] = None, limit: int = 5) -> List[Question]:
+    # DB_PATH は config.py から
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         base = ("SELECT id,skill,level,type,prompt,choices_json,answer_key,"
