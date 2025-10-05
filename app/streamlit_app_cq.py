@@ -5,6 +5,16 @@ from typing import List, Set
 import time, subprocess
 import os
 DEBUG = os.getenv("CQ_DEBUG", "0") == "1"
+import streamlit as st
+
+with st.sidebar:
+    if st.button("データ再読込（JSONL→DB）"):
+        try:
+            _ensure_db()
+            st.success("JSONLをDBへ再インポートしました。")
+        except Exception as e:
+            st.error(f"再インポート失敗: {e}")
+        st.experimental_rerun()
 
 # タイトルの直後などに一度だけ
 st.markdown("""
@@ -44,6 +54,53 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from services.db import load_questions
 from services.grader import grade_mcq, grade_sjt
 from services.ai_eval import eval_free_response  # 自由記述のAI評価
+# === DBが無ければJSONLから自動作成するセットアップ ===
+import os
+from pathlib import Path
+
+# どっちのインポート形でも動くように両対応
+try:
+    from app.services import import_jsonl as _imp
+except Exception:
+    from services import import_jsonl as _imp  # 旧構成向け
+
+try:
+    # configがある構成
+    from app.services.config import DB_PATH, JSONL_PATH
+except Exception:
+    # configが無い構成のフォールバック
+    DB_PATH = Path("data/cq.db")
+    JSONL_PATH = Path("data/questions.jsonl")
+
+def _ensure_db():
+    """DBが無い/空/古い場合に JSONL→DB を実行する"""
+    jsonl = Path(JSONL_PATH)
+    db = Path(DB_PATH)
+
+    need = False
+    if not db.exists():
+        need = True
+    else:
+        try:
+            # JSONLがDBより新しければ再インポート
+            need = jsonl.exists() and jsonl.stat().st_mtime > db.stat().st_mtime
+            # 破損/空DB（極小サイズ）のときも念のため再作成
+            if db.stat().st_size < 1024:
+                need = True
+        except Exception:
+            need = True
+
+    if need:
+        # import_jsonlの関数名が run / import_jsonl どちらでも動くように
+        if hasattr(_imp, "run"):
+            _imp.run(str(jsonl), str(db))
+        elif hasattr(_imp, "import_jsonl"):
+            _imp.import_jsonl()
+        else:
+            raise RuntimeError("import_jsonl.py に run() も import_jsonl() も見つかりません。")
+
+_ensure_db()
+# === ここまでセットアップ ===
 
 # --- ページ設定 ---
 st.set_page_config(page_title="CQ App (MVP)", page_icon="🎧", layout="centered")
