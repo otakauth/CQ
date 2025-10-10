@@ -1,91 +1,56 @@
-# -*- coding: utf-8 -*-
-
-# -------------------------------
-# 起動前セットアップ：DBが無ければJSONLから自動生成
-# -------------------------------
+import sys, os, re
+from typing import List, Set
 from pathlib import Path
-import os
+import streamlit as st
 
-# import_jsonl は両対応（app.services / services）
+# --- パス設定（app/ 下で services を import できるように） ---
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# === services モジュール ===
+from services.db import load_questions
+from services.grader import grade_mcq, grade_sjt
+from services.ai_eval import eval_free_response  # 自由記述のAI評価
+
+# === DBが無ければJSONLから自動作成するセットアップ ===
+# どっちの構成でも動くように両対応インポート
 try:
     from app.services import import_jsonl as _imp
 except Exception:
     from services import import_jsonl as _imp  # 旧構成向け
 
-# DB/JSONL パスも両対応
 try:
+    # config がある構成
     from app.services.config import DB_PATH, JSONL_PATH
 except Exception:
+    # config が無い構成のフォールバック
     DB_PATH = Path("data/cq.db")
     JSONL_PATH = Path("data/questions.jsonl")
-
-# -*- coding: utf-8 -*-
-
-# -------------------------------
-# 起動前セットアップ：DBが無ければJSONLから自動生成＋スキーマ検証
-# -------------------------------
-from pathlib import Path
-import os
-import sqlite3
-
-# import_jsonl は両対応（app.services / services）
-try:
-    from app.services import import_jsonl as _imp
-except Exception:
-    from services import import_jsonl as _imp  # 旧構成向け
-
-# DB/JSONL パスも両対応
-try:
-    from app.services.config import DB_PATH, JSONL_PATH
-except Exception:
-    DB_PATH = Path("data/cq.db")
-    JSONL_PATH = Path("data/questions.jsonl")
-
-REQUIRED_MIN_COLS = {"id", "skill", "level", "type", "prompt", "answer_key", "difficulty"}
-
-def _current_cols(db_path: Path) -> set:
-    if not db_path.exists():
-        return set()
-    try:
-        with sqlite3.connect(db_path) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='questions'")
-            if not cur.fetchone():
-                return set()
-            cur.execute("PRAGMA table_info(questions)")
-            return {row[1] for row in cur.fetchall()}  # row[1] = column name
-    except Exception:
-        return set()
-
-def _schema_is_valid(db_path: Path) -> bool:
-    cols = _current_cols(db_path)
-    return bool(cols) and REQUIRED_MIN_COLS.issubset(cols)
-
-def _run_import(jsonl: Path, db: Path):
-    # import_jsonl の関数名が run / import_jsonl どちらでも動くように
-    if hasattr(_imp, "run"):
-        _imp.run(str(jsonl), str(db))
-    elif hasattr(_imp, "import_jsonl"):
-        _imp.import_jsonl()
-    else:
-        raise RuntimeError("import_jsonl.py に run() も import_jsonl() も見つかりません。")
 
 def _ensure_db():
-    """DB が無い / 壊れている / スキーマが古い ときに JSONL→DB を実行"""
+    """
+    DBが無い/空/古い場合に JSONL→DB を実行する。
+    環境変数 FORCE_IMPORT=1 があれば強制再インポート。
+    """
     jsonl = Path(JSONL_PATH)
     db = Path(DB_PATH)
 
     need = False
 
-    # 1) 物理的に無い/小さすぎる → 作成
-    if (not db.exists()) or (db.stat().st_size < 1024):
+    # 強制フラグ
+    if os.getenv("FORCE_IMPORT", "0") == "1":
         need = True
 
-    # 2) スキーマ検証（必須列が無ければ再作成）
-    if not need and not _schema_is_valid(db):
+    # DBが無い/小さすぎる
+    if not db.exists():
         need = True
+    else:
+        try:
+            if db.stat().st_size < 1024:
+                need = True
+        except Exception:
+            need = True
 
-    # 3) JSONL の方が新しければ再作成
+    # JSONL が DB より新しければ再インポート
     if not need:
         try:
             if jsonl.exists() and jsonl.stat().st_mtime > db.stat().st_mtime:
@@ -93,54 +58,39 @@ def _ensure_db():
         except Exception:
             need = True
 
-    # 4) 環境変数で強制再作成（必要時）
-    if os.getenv("CQ_REBUILD_DB", "0") == "1":
-        need = True
-
     if need:
-        # 既存があれば削除してクリーンに再生成（スキーマ確実化）
-        try:
-            if db.exists():
-                db.unlink()
-        except Exception:
-            pass
-        _run_import(jsonl, db)
+        # import_jsonl.py の関数名両対応
+        if hasattr(_imp, "run"):
+            _imp.run(str(jsonl), str(db))
+        elif hasattr(_imp, "import_jsonl"):
+            _imp.import_jsonl()
+        else:
+            raise RuntimeError("import_jsonl.py に run() も import_jsonl() も見つかりません。")
 
 _ensure_db()
-# =============================== ここからUI ===============================
+# === セットアップここまで ===
 
-
-# =============================== ここからUI ===============================
-
-import streamlit as st
-
-# --- ページ設定（最初のStreamlit呼び出しで実行すること） ---
+# --- ページ設定 ---
 st.set_page_config(page_title="CQ App (MVP)", page_icon="🎧", layout="centered")
-
-# --- 以降の依存（両対応インポート） ---
-try:
-    from app.services.db import load_questions
-    from app.services.grader import grade_mcq, grade_sjt
-    from app.services.ai_eval import eval_free_response
-except ModuleNotFoundError:
-    # 実行ディレクトリが app/ などの場合のフォールバック
-    import sys
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from services.db import load_questions
-    from services.grader import grade_mcq, grade_sjt
-    from services.ai_eval import eval_free_response
-
-from typing import List, Set
-
 st.title("🎧 CQ アプリ（MVP）")
 
-# 黒文字＆引用スタイル
+# --- 見た目調整（黒文字＆引用ブロック） ---
 st.markdown("""
 <style>
-.stMarkdown p, .stMarkdown blockquote, .stMarkdown li, .stMarkdown span { color: #000000 !important; }
+/* 全体のテキストを黒寄りに */
+.stMarkdown p, .stMarkdown blockquote, .stMarkdown li, .stMarkdown span {
+  color: #111 !important;
+}
+
+/* 引用ブロック（> A: など） */
 blockquote {
-  font-size: 1.05rem; line-height: 1.8; color: #000000 !important;
-  margin: 0.2rem 0 0.8rem 0; border-left: 4px solid #ccc; padding-left: 0.8rem; background-color: #fafafa;
+  font-size: 1.05rem;
+  line-height: 1.8;
+  color: #111 !important;
+  margin: 0.2rem 0 0.8rem 0;
+  border-left: 4px solid #ccc;
+  padding-left: 0.8rem;
+  background-color: #fafafa;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -149,28 +99,29 @@ blockquote {
 # ヘルパー
 # -------------------------------
 def domain_tagset(domain_label: str) -> Set[str]:
-    """ドメイン選択に応じた優先タグ集合（厳格）"""
+    """ドメイン選択に応じた優先タグ集合"""
     if domain_label == "ビジネス":
         return {"business", "workplace", "meeting", "team", "office", "review", "deadline", "decision"}
     else:  # 日常
         return {"daily", "日常", "friend", "family", "生活", "home", "communication"}
 
 def filter_by_domain_strict(qs, domain_label: str, want: int) -> List:
-    """指定ドメインのタグに一致する問題のみを返す（不足分の越境補充はしない）"""
+    """タグ一致のみ採用（越境補充なし）"""
     pref = domain_tagset(domain_label)
     matched = [q for q in qs if any(t in pref for t in (q.tags or []))]
     return matched[:want]
 
 def render_prompt_block(text: str):
-    """会話や長文を読みやすく描画（引用＋改行維持。HTMLラップしない）"""
+    """会話や長文を読みやすく描画（引用＋改行維持、A:/B:の前に空行）"""
     if not text:
         return
-    # 「 A:」「 B:」「 C:」の直前に空行を入れる（視認性UP）
-    text = (text
-            .replace(" A:", "\n\nA:")
-            .replace(" B:", "\n\nB:")
-            .replace(" C:", "\n\nC:"))
-    # Markdownで改行を維持するため行末に半角スペース2つ
+
+    # 「 A:」「 B:」「 C:」の直前に空行を入れる（文頭/直後どちらでも機能）
+    text = re.sub(r'\s+A:', '\n\nA:', text)
+    text = re.sub(r'\s+B:', '\n\nB:', text)
+    text = re.sub(r'\s+C:', '\n\nC:', text)
+
+    # Markdown改行維持（行末半角スペース2つ）
     lines = [ln.rstrip() + "  " for ln in text.split("\n")]
     body = "\n".join([f"> {ln}" if ln else ">" for ln in lines])
 
@@ -185,14 +136,14 @@ def clear_answer_widgets():
             del st.session_state[k]
 
 # -------------------------------
-# アプリ説明（折りたたみ）
+# 上部UI：アプリ説明（閉じられる）
 # -------------------------------
 with st.expander("このアプリの説明", expanded=False):
     st.markdown(
-        "このアプリは **文脈理解力（CQ: Context Quotient）** を鍛えるアプリの試作版です。\n\n"
+        "このアプリは **文脈理解力（CQ: Context Quotient）** を鍛える試作版です。\n\n"
         "【使い方】\n"
         "1) ドメイン（ビジネス／日常）とカテゴリを選ぶ → 2問が出題されます。\n"
-        "2) 選択式のカテゴリは「採点する」で正誤と解説を確認できます。\n"
+        "2) 選択式は「採点する」で正誤と解説を確認できます。\n"
         "3) **状況判断**は正解を出さず、選択の文脈解説＋**自由記述**をAIが評価します。\n"
         "4) 下部の **「次の問題を解く（2問）」** で新しい2問が出題されます。"
     )
@@ -233,14 +184,17 @@ def get_new_batch(_skill: str, _domain: str, want: int = 2):
     is_sjt = (_skill == "状況判断")
     picked = []
 
+    # 多めに引いてからタイプで絞る
     candidates = load_questions(skill_filter=_skill, limit=200)
     if is_sjt:
         candidates = [q for q in candidates if q.type == "sjt"]
     else:
         candidates = [q for q in candidates if q.type != "sjt"]
 
+    # ドメインで厳格フィルタ
     domain_candidates = filter_by_domain_strict(candidates, _domain, want=want)
 
+    # 未出題のみ
     for q in domain_candidates:
         if len(picked) >= want:
             break
@@ -328,9 +282,7 @@ if is_sjt_mode:
             with st.container(border=True):
                 st.markdown("**シナリオ（再掲）**")
                 render_prompt_block(q.prompt)
-
             st.markdown(f"**あなたの選択:** 🟢 {fb['chosen'] or '—'}")
-
             st.markdown("#### 各選択肢の解説")
             for key in ["A", "B", "C", "D"]:
                 if q.feedbacks and key in q.feedbacks:
@@ -340,7 +292,6 @@ if is_sjt_mode:
                         st.markdown(f"**👉 {line}**")
                     else:
                         st.markdown(line)
-
             user_free = (st.session_state.get(f"free_{q.id}") or "").strip()
             if user_free:
                 ai = eval_free_response(q.prompt, user_free)
@@ -356,14 +307,11 @@ if is_sjt_mode:
                 st.write(f"- 要点指摘: {ai.get('short_feedback', '—')}")
                 st.write(f"- 次ドリル: {ai.get('next_drill', '—')}")
             st.markdown("---")
-
         st.info("※ 状況判断は正誤を出さず、各選択肢の解説と自由記述AI評価を提示します。")
-
 else:
     if st.button("採点する", type="primary", use_container_width=True):
         results, correct, total = grade_mcq(questions, answers)
         st.success(f"スコア：{correct} / {total}（{round(100 * correct / total)} 点）")
-
         with st.expander("各問の解説・正答"):
             for i, r in enumerate(results, start=1):
                 st.markdown(
@@ -371,7 +319,6 @@ else:
                 )
                 st.write(f"- あなたの選択: {r.chosen or '—'}")
                 st.write(f"- 正答: {r.correct_key or '—'}")
-
                 q = questions[i - 1]
                 st.markdown("**解説（選択肢別）**")
                 ex_dict = q.explanations or {}
@@ -384,13 +331,8 @@ else:
                         else:
                             st.markdown(line)
                         rendered_any = True
-
                 if not rendered_any:
-                    if r.explanation:
-                        st.write(f"- 根拠: {r.explanation}")
-                    else:
-                        st.write("（この問題には解説が登録されていません）")
-
+                    st.write("（この問題には解説が登録されていません）")
                 st.markdown("---")
 
 # -------------------------------
