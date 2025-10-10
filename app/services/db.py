@@ -1,17 +1,37 @@
+# app/services/db.py
 import json
 import sqlite3
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set
 from app.domain.models import Question
 from app.services.config import DB_PATH
 
-def _get_columns(conn: sqlite3.Connection) -> set:
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(questions)")
-    cols = {row[1] for row in cur.fetchall()}  # row[1] = column name
-    return cols
+# ---- 内部ヘルパ ----
 
-def _resolve_col(cols: set, preferred: str, fallback: str) -> str:
-    return preferred if preferred in cols else fallback
+def _get_columns(conn: sqlite3.Connection) -> Set[str]:
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='questions'")
+    if not cur.fetchone():
+        return set()
+    cur.execute("PRAGMA table_info(questions)")
+    return {row[1] for row in cur.fetchall()}  # row[1] = column name
+
+def _col(cols: Set[str], name: str, default_sql: str) -> str:
+    """
+    実DBに 'name' 列があればそのまま、無ければ default_sql を使って
+    SELECT句で同名エイリアスにする（例: \"'' AS level\" や \"0.5 AS difficulty\"）
+    """
+    return name if name in cols else f"{default_sql} AS {name}"
+
+def _json_col(cols: Set[str], preferred: str, fallback: str) -> str:
+    """
+    JSON系の列は *_json 優先、無ければ旧名、どちらも無ければ NULL を返す。
+    戻り値は SELECT句にそのまま置けるSQL断片。
+    """
+    if preferred in cols:
+        return preferred
+    if fallback in cols:
+        return fallback
+    return f"NULL AS {preferred}"
 
 def _rows_to_questions(rows) -> List[Question]:
     out: List[Question] = []
@@ -31,42 +51,63 @@ def _rows_to_questions(rows) -> List[Question]:
         ))
     return out
 
-def _build_select(cols: set) -> Tuple[str, str, str, str]:
+def _build_select(cols: Set[str]) -> str:
     """
-    実DBのカラム名に合わせて SELECT 句を動的生成。
-    戻り値は (choices_col, explanations_col, tags_col, feedbacks_col)
+    実DBの列に合わせて安全な SELECT を構築。
+    無い列はリテラルで補完し、最終的に以下の順で返す：
+      id, skill, level, type, prompt,
+      choices_json, answer_key, explanations_json, difficulty, tags_json, feedbacks_json
     """
-    choices_col      = _resolve_col(cols, "choices_json", "choices")
-    explanations_col = _resolve_col(cols, "explanations_json", "explanations")
-    tags_col         = _resolve_col(cols, "tags_json", "tags")
-    feedbacks_col    = _resolve_col(cols, "feedbacks_json", "feedbacks")
+    # 基本列（無ければ既定値で補完）
+    id_expr         = _col(cols, "id",         "''")
+    skill_expr      = _col(cols, "skill",      "''")
+    level_expr      = _col(cols, "level",      "''")
+    type_expr       = _col(cols, "type",       "''")
+    prompt_expr     = _col(cols, "prompt",     "''")
+    answer_key_expr = _col(cols, "answer_key", "NULL")
+    difficulty_expr = _col(cols, "difficulty", "0.5")
 
-    # skill/level/type/prompt/difficulty は両スキーマで同名前提
+    # JSON系（*_json 優先→旧名→NULL）
+    choices_expr      = _json_col(cols, "choices_json",      "choices")
+    explanations_expr = _json_col(cols, "explanations_json", "explanations")
+    tags_expr         = _json_col(cols, "tags_json",         "tags")
+    feedbacks_expr    = _json_col(cols, "feedbacks_json",    "feedbacks")
+
     select_sql = (
-        f"SELECT id,skill,level,type,prompt,"
-        f"{choices_col},answer_key,{explanations_col},"
-        f"difficulty,{tags_col},{feedbacks_col} FROM questions "
+        "SELECT "
+        f"{id_expr}, {skill_expr}, {level_expr}, {type_expr}, {prompt_expr}, "
+        f"{choices_expr}, {answer_key_expr}, {explanations_expr}, "
+        f"{difficulty_expr}, {tags_expr}, {feedbacks_expr} "
+        "FROM questions "
+        "ORDER BY RANDOM() "
+        "LIMIT ?"
     )
-    return select_sql, choices_col, explanations_col, tags_col
+    return select_sql
+
+# ---- 公開API ----
 
 def load_questions(skill_filter: Optional[str] = None, limit: int = 5) -> List[Question]:
     with sqlite3.connect(DB_PATH) as conn:
         cols = _get_columns(conn)
-
-        # テーブルが存在しない or 必須列が無い場合は即エラーにしてログで気づけるように
-        required_min = {"id", "skill", "level", "type", "prompt", "answer_key", "difficulty"}
-        if not required_min.issubset(cols):
-            raise sqlite3.OperationalError(
-                f"questions テーブルの必須列が不足しています。見つかった列: {sorted(cols)}"
-            )
-
-        base_select, *_ = _build_select(cols)
-
         cur = conn.cursor()
+
+        # テーブルが無い場合は空配列（UI側で「不足」警告を出す前提）
+        if not cols:
+            return []
+
+        base_select = _build_select(cols)
+
         if skill_filter:
-            cur.execute(base_select + "WHERE skill=? ORDER BY RANDOM() LIMIT ?", (skill_filter, limit))
+            # skill列が無いDBでも _build_select が '' AS skill を返すため WHERE は掛けられない
+            # → その場合は全体から取る（列不足DBの暫定運用）
+            if "skill" in cols:
+                cur.execute(base_select.replace("LIMIT ?", "WHERE skill=? ORDER BY RANDOM() LIMIT ?"),
+                            (skill_filter, limit))
+            else:
+                cur.execute(base_select, (limit,))
         else:
-            cur.execute(base_select + "ORDER BY RANDOM() LIMIT ?", (limit,))
+            cur.execute(base_select, (limit,))
+
         rows = cur.fetchall()
 
     return _rows_to_questions(rows)
