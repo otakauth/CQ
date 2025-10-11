@@ -95,19 +95,20 @@ def load_questions(skill_filter: Optional[str] = None, limit: int = 5) -> List[Q
         if not cols:
             return []
 
-        base_select = _build_select(cols)
+        # SELECT句を構築（WHERE句はここで組み立てる）
+        select_sql = _build_select(cols)
+        # "ORDER BY RANDOM() LIMIT ?" の部分を除去してベース化
+        base_sql = select_sql.replace("ORDER BY RANDOM() LIMIT ?", "")
 
-        if skill_filter:
-            # skill列が無いDBでも _build_select が '' AS skill を返すため WHERE は掛けられない
-            # → その場合は全体から取る（列不足DBの暫定運用）
-            if "skill" in cols:
-                cur.execute(base_select.replace("LIMIT ?", "WHERE skill=? ORDER BY RANDOM() LIMIT ?"),
-                            (skill_filter, limit))
-            else:
-                cur.execute(base_select, (limit,))
-        else:
-            cur.execute(base_select, (limit,))
+        params = []
+        if skill_filter and "skill" in cols:
+            base_sql += " WHERE skill=?"
+            params.append(skill_filter)
 
+        base_sql += " ORDER BY RANDOM() LIMIT ?"
+        params.append(limit)
+
+        cur.execute(base_sql, params)
         rows = cur.fetchall()
 
     return _rows_to_questions(rows)
