@@ -25,6 +25,27 @@ except Exception:
     # config が無い構成のフォールバック
     DB_PATH = Path("data/cq.db")
     JSONL_PATH = Path("data/questions.jsonl")
+
+ # --- DEVメッセージ制御（ユーザーに見せない） ---
+def _get_query_params_safe():
+    try:
+        return st.query_params  # Streamlit 1.27+
+    except Exception:
+        try:
+            return st.experimental_get_query_params()  # 古い互換
+        except Exception:
+            return {}
+
+_QP = _get_query_params_safe()
+DEBUG_DEV = (os.getenv("CQ_DEBUG", "0") == "1") or (_QP.get("debug", ["0"])[0] == "1")
+
+def dev_notice(msg: str):
+    """開発者だけが気づける場所に出す（UIには出さない）"""
+    if DEBUG_DEV:
+        st.warning(msg)
+    else:
+        print(f"[DEV ONLY] {msg}")
+   
 # --- Streamlit Cloud対応: data/cq.db を /tmp にコピー ---
 import shutil
 from pathlib import Path
@@ -178,7 +199,7 @@ def clear_answer_widgets():
 # -------------------------------
 with st.expander("このアプリの説明", expanded=False):
     st.markdown(
-        "このアプリは **文脈理解力（CQ: Context Quotient）** を鍛える試作版です。\n\n"
+        "このアプリは **文脈理解力（CQ: Context Quotient）** を鍛えるアプリの試作版です。\n\n"
         "【使い方】\n"
         "1) ドメイン（ビジネス／日常）とカテゴリを選ぶ → 2問が出題されます。\n"
         "2) 選択式は「採点する」で正誤と解説を確認できます。\n"
@@ -219,33 +240,42 @@ if "_last_loaded_batch_no" not in st.session_state:
 # バッチ取得
 # -------------------------------
 def get_new_batch(_skill: str, _domain: str, want: int = 2):
+    """
+    指定スキル／ドメインから未出題の問題を最大 want 件返す。
+    在庫不足時はユーザー向けUIには出さず、開発者向けに dev_notice だけ出す。
+    """
     is_sjt = (_skill == "状況判断")
     picked = []
 
-    # 多めに引いてからタイプで絞る
+    # 多めに取得 → タイプで絞る
     candidates = load_questions(skill_filter=_skill, limit=200)
     if is_sjt:
         candidates = [q for q in candidates if q.type == "sjt"]
     else:
         candidates = [q for q in candidates if q.type != "sjt"]
 
-    # ドメインで厳格フィルタ
+    # ドメイン厳格フィルタ（越境補充なし）
     domain_candidates = filter_by_domain_strict(candidates, _domain, want=want)
 
-    # 未出題のみ
+    # 未出題のみを pick
+    seen = st.session_state.get("seen_ids", set())
     for q in domain_candidates:
         if len(picked) >= want:
             break
-        if q.id not in st.session_state.seen_ids:
+        if q.id not in seen:
             picked.append(q)
-            st.session_state.seen_ids.add(q.id)
+            seen.add(q.id)
+    st.session_state["seen_ids"] = seen
 
+    # 在庫不足は DEV だけ通知（UIには出さない）
     if len(picked) < want:
-        st.warning(
+        dev_notice(
             f"{_domain}×{_skill} の登録問題が不足しています（{len(picked)}/{want}）。"
-            " `data/questions.jsonl` に追加して import してください。"
+            " data/questions.jsonl に追加して import してください。"
         )
+
     return picked
+
 
 # スキル or ドメイン変更検知
 if (st.session_state.current_skill != skill) or (st.session_state.current_domain != domain):
@@ -266,8 +296,11 @@ if st.session_state._last_loaded_batch_no != st.session_state.batch_no:
 questions = st.session_state.fixed_questions
 
 if not questions:
-    st.warning("この条件での登録問題が不足しています。`data/questions.jsonl` に追記して import してください。")
+    dev_notice("この条件での登録問題が不足しています。data/questions.jsonl に追記して import してください。")
+    # ユーザーには汎用の優しい文言のみ
+    st.info("この条件の問題はもうないよ。別のドメイン/カテゴリをお試しください。")
     st.stop()
+
 
 st.divider()
 st.subheader(f"出題：{domain} × {skill}（{len(questions)}問）")
