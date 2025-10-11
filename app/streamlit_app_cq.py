@@ -30,15 +30,24 @@ import shutil
 from pathlib import Path
 
 local_db = Path("data/cq.db")
-cloud_db = Path("/tmp/cq.db")
+# --- Cloud用DBコピー（config側で処理済みのため、ここでは安全にスキップ） ---
+import os, shutil, tempfile
+from pathlib import Path
 
-# Cloud環境なら /tmp に強制コピー
-if not cloud_db.exists() and local_db.exists():
-    try:
-        shutil.copy(local_db, cloud_db)
-        print("✅ Copied local DB to /tmp for Streamlit Cloud")
-    except Exception as e:
-        print(f"⚠️ Cloud DB copy failed: {e}")
+# 既存の data/cq.db を基準に動作（ローカルでは /tmp を使わない）
+local_db = Path("data/cq.db")
+_tmpdir = Path(tempfile.gettempdir())
+
+# Linux（Streamlit Cloudなど）でのみコピーを試みる
+if os.name == "posix":
+    tmp_db = _tmpdir / "cq.db"
+    if (not tmp_db.exists()) and local_db.exists():
+        try:
+            shutil.copy(local_db, tmp_db)
+            print("✅ Copied DB to /tmp for Streamlit Cloud")
+        except Exception:
+            pass  # ⚠️ ローカルWindowsでは無視（ログ出さない）
+
 
 def _ensure_db():
     """
