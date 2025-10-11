@@ -30,6 +30,8 @@ def _ensure_db():
     """
     DBが無い/空/古い場合に JSONL→DB を実行する。
     環境変数 FORCE_IMPORT=1 があれば強制再インポート。
+    Streamlit Cloud など一時環境では DB が存在しないことがあるため、
+    無くても常に安全に再生成できるようにしている。
     """
     jsonl = Path(JSONL_PATH)
     db = Path(DB_PATH)
@@ -66,8 +68,21 @@ def _ensure_db():
             _imp.import_jsonl()
         else:
             raise RuntimeError("import_jsonl.py に run() も import_jsonl() も見つかりません。")
+    else:
+        # ✅ Cloud環境でDBが存在しないときの安全対策（暫定）
+        # デプロイ直後に /tmp や data/ が空の場合、毎回JSONLから再生成する
+        try:
+            if not db.exists() or db.stat().st_size < 1024:
+                if hasattr(_imp, "run"):
+                    _imp.run(str(jsonl), str(db))
+                elif hasattr(_imp, "import_jsonl"):
+                    _imp.import_jsonl()
+        except Exception as e:
+            print(f"[WARN] 強制再生成失敗: {e}")
 
 _ensure_db()
+
+
 # === セットアップここまで ===
 
 # --- ページ設定 ---
