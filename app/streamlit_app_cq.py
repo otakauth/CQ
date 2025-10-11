@@ -25,6 +25,20 @@ except Exception:
     # config が無い構成のフォールバック
     DB_PATH = Path("data/cq.db")
     JSONL_PATH = Path("data/questions.jsonl")
+# --- Streamlit Cloud対応: data/cq.db を /tmp にコピー ---
+import shutil
+from pathlib import Path
+
+local_db = Path("data/cq.db")
+cloud_db = Path("/tmp/cq.db")
+
+# Cloud環境なら /tmp に強制コピー
+if not cloud_db.exists() and local_db.exists():
+    try:
+        shutil.copy(local_db, cloud_db)
+        print("✅ Copied local DB to /tmp for Streamlit Cloud")
+    except Exception as e:
+        print(f"⚠️ Cloud DB copy failed: {e}")
 
 def _ensure_db():
     """
