@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from services.db import load_questions
 from services.grader import grade_mcq, grade_sjt
 from services.ai_eval import eval_free_response  # 自由記述のAI評価
+from services.ai_eval import gen_session_feedback  # セッション講評生成
+
 
 # === DBが無ければJSONLから自動作成するセットアップ ===
 # どっちの構成でも動くように両対応インポート
@@ -132,6 +134,10 @@ _ensure_db()
 # --- ページ設定 ---
 st.set_page_config(page_title="CQ App (MVP)", page_icon="🎧", layout="centered")
 st.title("🎧 CQ アプリ（MVP）")
+# ▼通算リセットボタン
+if st.button("🧹 通算をリセット", help="回をまたいだ講評履歴を消去します"):
+    st.session_state.history_items = []
+    st.success("通算データをリセットしました。")
 
 # --- 見た目調整（黒文字＆引用ブロック） ---
 st.markdown("""
@@ -157,6 +163,44 @@ blockquote {
 # -------------------------------
 # ヘルパー
 # -------------------------------
+def _render_session_summary(summary: dict | None):
+    # 安全化：None や想定外型でも落とさない
+    if not isinstance(summary, dict) or not summary:
+        st.info("まだ通算データがありません。")
+        return
+
+    scores = summary.get("skill_scores", {}) or {}
+    st.markdown("**スキル別スコア**")
+    for k, v in scores.items():
+        try:
+            st.markdown(f"- {k}: {float(v):.2f}")
+        except Exception:
+            st.markdown(f"- {k}: {v}")
+
+    def _bullets(title, key):
+        items = summary.get(key) or []
+        if not items:
+            return
+        st.markdown(f"**{title}**")
+        for x in items:
+            st.markdown(f"- {x}")
+
+    _bullets("特徴", "traits")
+    _bullets("強み", "strengths")
+    _bullets("弱み", "weaknesses")
+    _bullets("次アクション", "next_actions")
+
+    recs = summary.get("recommended_drills") or []
+    if recs:
+        st.markdown("**おすすめドリル**")
+        for d in recs:
+            skill = d.get("skill", "")
+            level = d.get("level", "")
+            tags  = ", ".join(d.get("tags") or [])
+            why   = d.get("why", "")
+            st.markdown(f"- {skill}（{level}）｜{tags} — {why}")
+
+
 def domain_tagset(domain_label: str) -> Set[str]:
     """ドメイン選択に応じた優先タグ集合"""
     if domain_label == "ビジネス":
@@ -235,6 +279,16 @@ if "batch_no" not in st.session_state:
     st.session_state.batch_no = 0
 if "_last_loaded_batch_no" not in st.session_state:
     st.session_state._last_loaded_batch_no = -1
+# 回を跨いだ通算の履歴（各問の成績をここに貯める）
+if "history_items" not in st.session_state:
+    st.session_state.history_items = []
+# --- 採点状態フラグと講評の一時保持 ---
+if "_graded" not in st.session_state:
+    st.session_state._graded = False
+if "_ai_summary" not in st.session_state:
+    st.session_state._ai_summary = None
+if "_ai_summary_total" not in st.session_state:
+    st.session_state._ai_summary_total = None
 
 # -------------------------------
 # バッチ取得
@@ -292,6 +346,10 @@ if st.session_state._last_loaded_batch_no != st.session_state.batch_no:
     qs = get_new_batch(skill, domain, want=2)
     st.session_state.fixed_questions = qs
     st.session_state._last_loaded_batch_no = st.session_state.batch_no
+# 新しいバッチに切り替わったので採点状態と講評をリセット
+st.session_state._graded = False
+st.session_state._ai_summary = None
+st.session_state._ai_summary_total = None
 
 questions = st.session_state.fixed_questions
 
@@ -346,7 +404,10 @@ for i, q in enumerate(questions, start=1):
 is_sjt_mode = (skill == "状況判断")
 
 if is_sjt_mode:
-    if st.button("フィードバックを見る", type="primary", use_container_width=True):
+    if st.session_state.get("_graded", False):
+        st.info("このバッチは採点済みです。下部の「次の問題を解く（2問）」で新バッチに進めます。")
+    elif st.button("フィードバックを見る", type="primary", use_container_width=True):
+
         feedbacks = grade_sjt(questions, answers)
         for i, (q, fb) in enumerate(zip(questions, feedbacks), start=1):
             st.markdown(f"### Q{i}")
@@ -379,8 +440,122 @@ if is_sjt_mode:
                 st.write(f"- 次ドリル: {ai.get('next_drill', '—')}")
             st.markdown("---")
         st.info("※ 状況判断は正誤を出さず、各選択肢の解説と自由記述AI評価を提示します。")
-else:
-    if st.button("採点する", type="primary", use_container_width=True):
+
+        # ===== セッション講評（AI：状況判断） =====
+        from services.ai_eval import gen_session_feedback
+
+        # ① 自由記述の評価キャッシュ（表示用と集計用で使い回し）
+        _free_cache: dict[str, dict] = {}
+
+        session_items = []
+        for q, fb in zip(questions, feedbacks):
+            # 自由記述スコア（0..1）— 二重評価を避ける
+            user_free = (st.session_state.get(f"free_{q.id}") or "").strip()
+            free_score01 = 0.0
+            if user_free:
+                ai = _free_cache.get(q.id)
+                if not ai:
+                    ai = eval_free_response(q.prompt, user_free)
+                    _free_cache[q.id] = ai
+                free_score01 = ai.get("score_total", 0) / 100.0
+
+            # skill 正規化（全角/半角スペース除去）
+            skill_norm = (q.skill or "").replace(" ", "").replace("　", "")
+
+            # 望ましい選択 best（answer_key 優先、なければ feedbacks の type を参照）
+            best_key = getattr(q, "answer_key", None)
+            if not best_key and getattr(q, "feedbacks", None):
+                try:
+                    best_key = next(
+                        (k for k, v in q.feedbacks.items() if (v or {}).get("type") in ("best", "good")),
+                        None
+                    )
+                except Exception:
+                    best_key = None
+
+            # ② 未判定（best/chosen が無い）を 0 点計上せずスキップ
+            #    ※ 自由記述があれば free_score01 だけで反映する
+            item = {
+                "id": q.id,
+                "type": q.type,          # "sjt"
+                "skill": skill_norm,
+                "tags": q.tags or [],
+                "free_score01": free_score01,
+                "chosen": fb.get("chosen"),
+                "best": best_key,
+            }
+            if (item["best"] is None or item["chosen"] is None) and free_score01 == 0.0:
+                # 選択評価も自由記述も無い → 平均を歪めるので除外
+                continue
+
+            session_items.append(item)
+        st.session_state.history_items.extend(session_items)
+
+        print("DEBUG session_items:", session_items)
+        summary = gen_session_feedback(session_items)
+# 採点完了フラグとAI講評キャッシュを更新（SJT）
+        st.session_state._graded = True
+        st.session_state._ai_summary = summary
+        st.session_state._ai_summary_total = None
+
+        # ③ JSON“そのまま出力”ではなく、箇条書きでレンダリング
+        def _render_session_summary(summary: dict):
+            scores = summary.get("skill_scores", {}) or {}
+            st.markdown("**スキル別スコア**")
+            for k, v in scores.items():
+                try:
+                    st.markdown(f"- {k}: {float(v):.2f}")
+                except Exception:
+                    st.markdown(f"- {k}: {v}")
+
+            def _bullets(title, key):
+                items = summary.get(key) or []
+                if not items:
+                    return
+                st.markdown(f"**{title}**")
+                for x in items:
+                    st.markdown(f"- {x}")
+
+            _bullets("特徴", "traits")
+            _bullets("強み", "strengths")
+            _bullets("弱み", "weaknesses")
+            _bullets("次アクション", "next_actions")
+
+            recs = summary.get("recommended_drills") or []
+            if recs:
+                st.markdown("**おすすめドリル**")
+                for d in recs:
+                    skill = d.get("skill", "")
+                    level = d.get("level", "")
+                    tags  = ", ".join(d.get("tags") or [])
+                    why   = d.get("why", "")
+                    st.markdown(f"- {skill}（{level}）｜{tags} — {why}")
+
+# （SJT専用）採点後のみAI講評ボタンを表示（デフォ表示防止＆二重表示防止）
+if is_sjt_mode and st.session_state.get("_graded", False) and st.session_state.get("history_items"):
+    if st.button("🧠 AI講評を見る", type="secondary", use_container_width=True, key=f"ai_summary_btn_sjt_{st.session_state.batch_no}"):
+
+        # ✅ 通算のみ表示（セッション講評は出さない）
+        total_payload = {"session_items": st.session_state.history_items}
+        summary_total = gen_session_feedback(total_payload)
+        st.session_state._ai_summary_total = summary_total
+        with st.expander("🧠 AI講評（通算）", expanded=True):
+            _render_session_summary(summary_total)
+
+
+
+
+
+
+
+
+
+if not is_sjt_mode:
+    if st.session_state.get("_graded", False):
+        st.info("このバッチは採点済みです。下部の「次の問題を解く（2問）」で新バッチに進めます。")
+    elif st.button("採点する", type="primary", use_container_width=True):
+
+ 
         results, correct, total = grade_mcq(questions, answers)
         st.success(f"スコア：{correct} / {total}（{round(100 * correct / total)} 点）")
         with st.expander("各問の解説・正答"):
@@ -406,10 +581,92 @@ else:
                     st.write("（この問題には解説が登録されていません）")
                 st.markdown("---")
 
+        # ===== セッション講評（AI：選択式） =====
+        from services.ai_eval import gen_session_feedback
+        from collections import defaultdict
+
+        # ① 今バッチの成績だけで、0/1 の厳密平均を作る（未回答は除外）
+        session_items = []
+        per_skill_correct = defaultdict(int)
+        per_skill_total   = defaultdict(int)
+
+        for r, q in zip(results, questions):
+            skill_norm = (q.skill or "").replace(" ", "").replace("　", "")
+
+            # 未回答は除外（平均を歪めない）
+            if r.is_correct is None and not r.chosen:
+                continue
+
+            # 0/1カウント（MCQのみ）
+            if r.is_correct is True:
+                per_skill_correct[skill_norm] += 1
+                per_skill_total[skill_norm]   += 1
+            elif r.is_correct is False:
+                per_skill_total[skill_norm]   += 1
+
+            session_items.append({
+                "id": q.id,
+                "type": q.type,          # "mcq"
+                "skill": skill_norm,
+                "difficulty": q.difficulty,
+                "tags": q.tags or [],
+                "correct": r.is_correct,
+                "chosen": r.chosen,
+                "answer_key": r.correct_key
+            })
+
+        # ② スキル別の正解率（0..1）を事前計算して LLM に手渡す
+        pre_skill_scores = {}
+        for sk, tot in per_skill_total.items():
+            if tot > 0:
+                pre_skill_scores[sk] = round(per_skill_correct[sk] / tot, 2)
+
+        # ③ 正解数/全問数も渡す（未回答は全問数に含めない）
+        correct_count = sum(1 for r in results if r.is_correct is True)
+        total_count   = len([r for r in results if r.is_correct is not None])
+
+        payload = {
+            "session_items": session_items,
+            "meta": {
+                "correct": correct_count,
+                "total": total_count,
+                "pre_skill_scores": pre_skill_scores,   # ←これを尊重させる
+            }
+        }
+        st.session_state._last_payload = payload  # ← AI講評ボタン用に保持
+
+        st.session_state.history_items.extend(session_items)
+        
+        print("DEBUG session_items:", session_items)
+        print("DEBUG meta:", payload["meta"])
+
+# 採点完了フラグのみ立て、AI講評はまだ生成しない
+st.session_state._graded = True
+st.session_state._ai_summary = None
+st.session_state._ai_summary_total = None
+
+# ボタン押下時のみAI講評を生成・表示
+if (not is_sjt_mode) and st.session_state.get("history_items") and st.button(
+    "🧠 AI講評を見る", type="secondary", use_container_width=True, key=f"ai_summary_btn_mcq_{st.session_state.batch_no}"
+):
+
+    # ✅ 通算だけを生成・表示（セッション講評は出さない）
+    total_payload = {"session_items": st.session_state.history_items}
+    summary_total = gen_session_feedback(total_payload)
+    st.session_state._ai_summary_total = summary_total
+    with st.expander("🧠 AI講評（通算）", expanded=True):
+        _render_session_summary(summary_total)
+
 # -------------------------------
 # 次の2問ボタン
 # -------------------------------
+
 st.divider()
 if st.button("次の問題を解く（2問）", type="secondary", use_container_width=True):
+    # 採点状態とAI講評を完全リセット
+    st.session_state._graded = False
+    st.session_state._ai_summary = None
+    st.session_state._ai_summary_total = None
     st.session_state.batch_no += 1
     st.rerun()
+

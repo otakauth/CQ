@@ -1,3 +1,3 @@
-﻿[server]
+[server]
 fileWatcherType = "none"
 runOnSave = false
