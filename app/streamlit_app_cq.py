@@ -2,6 +2,8 @@ import sys, os, re
 from typing import List, Set
 from pathlib import Path
 import streamlit as st
+from streamlit_lottie import st_lottie
+import json
 
 # --- パス設定（app/ 下で services を import できるように） ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -237,7 +239,54 @@ def clear_answer_widgets():
         s = str(k)
         if s.startswith("q_") or s.startswith("free_"):
             del st.session_state[k]
+# --- AIキャラ称賛・励まし（Lottie対応・パス修正版） ---
+# --- Lottieアセットを起動時に一度だけロード（ラグ削減） ---
+@st.cache_data(show_spinner=False)
+def _load_lottie_assets() -> dict:
+    base = Path(__file__).parent / "lottie"
+    mapping = {
+        "success": "success.json",
+        "happy":   "happy.json",
+        "grow":    "grow.json",
+        "retry":   "retry.json",
+    }
+    out = {}
+    for k, fn in mapping.items():
+        p = base / fn
+        if p.exists():
+            try:
+                out[k] = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+    return out
 
+_LOTTIE = _load_lottie_assets()
+
+# --- AIキャラ称賛・励まし（Lottie対応・キャッシュ版） ---
+def show_praise_card(correct_count: int, total_count: int):
+    """採点直後のフィードバック＋Lottie（ファイルI/O無しで高速表示）"""
+    try:
+        ratio = 0.0 if total_count == 0 else correct_count / total_count
+    except Exception:
+        ratio = 0.0
+
+    if ratio >= 0.9:
+        key, icon, title, msg = "success", "🎉", "完璧！", "まさに文脈マスター。AI Coachもびっくり。"
+    elif ratio >= 0.7:
+        key, icon, title, msg = "happy",   "👍", "いい感じ！", "安定感が出てきたね。あともう少しで満点。"
+    elif ratio >= 0.4:
+        key, icon, title, msg = "grow",    "🌱", "成長中！", "方向は合ってる。キーワードを1つ拾って次へ。"
+    else:
+        key, icon, title, msg = "retry",   "💪", "ドンマイ！", "失敗は上達の途中。“根拠”を1つ言葉にしてみよう。"
+
+    with st.container(border=True):
+        st.markdown(f"### 🐣 AI Coach: {icon} {title}")
+        st.write(msg)
+        data = _LOTTIE.get(key)
+        if data:
+            st_lottie(data, height=160, key=f"lottie_{key}")
+        else:
+            st.caption("（アニメ素材が見つかりません）")
 # -------------------------------
 # 上部UI：アプリ説明（閉じられる）
 # -------------------------------
@@ -558,6 +607,8 @@ if not is_sjt_mode:
  
         results, correct, total = grade_mcq(questions, answers)
         st.success(f"スコア：{correct} / {total}（{round(100 * correct / total)} 点）")
+        show_praise_card(correct, total)
+
         with st.expander("各問の解説・正答"):
             for i, r in enumerate(results, start=1):
                 st.markdown(
