@@ -5,3 +5,5 @@ streamlit-mic-recorder
 python-dotenv
 openai>=1.40.0
 anthropic>=0.34.0
+streamlit-lottie
+
