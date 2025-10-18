@@ -6,4 +6,7 @@ python-dotenv
 openai>=1.40.0
 anthropic>=0.34.0
 streamlit-lottie
+SQLAlchemy==2.0.36
+bcrypt==4.2.0
+
 

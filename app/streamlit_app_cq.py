@@ -29,6 +29,92 @@ except Exception:
     # config が無い構成のフォールバック
     DB_PATH = Path("data/cq.db")
     JSONL_PATH = Path("data/questions.jsonl")
+# === ユーザー認証（ログイン／登録） =========================================
+# services.auth を両対応インポート（account_id方式）
+try:
+    from app.services import auth as _auth
+except Exception:
+    from services import auth as _auth
+
+import streamlit as st
+
+# DB初期化
+_auth.init_db()
+
+# セッションに user を確保
+if "user" not in st.session_state:
+    st.session_state["user"] = None  # dict {id,account_id,display_name,...}
+
+def _render_auth_sidebar():
+    with st.sidebar:
+        st.subheader("Account")
+        mode = st.radio(" ", ["ログイン", "新規登録"], horizontal=True, label_visibility="collapsed")
+
+        if mode == "ログイン":
+            with st.form("login_form", clear_on_submit=False):
+                account_id = st.text_input("ユーザーID", key="login_account")
+                password = st.text_input("パスワード", type="password", key="login_pw")
+                submitted = st.form_submit_button("ログイン", use_container_width=True)
+                if submitted:
+                    u = _auth.authenticate(account_id, password)
+                    if u:
+                        st.session_state["user"] = u.to_public_dict()
+                        st.success("ログインしました")
+                        st.rerun()
+                    else:
+                        st.error("ユーザーIDまたはパスワードが違います")
+        else:
+            with st.form("register_form", clear_on_submit=False):
+                display_name = st.text_input("表示名（任意）", key="reg_name")
+                account_id = st.text_input("ユーザーID（英数推奨）", key="reg_account")
+                password = st.text_input("パスワード（8文字以上推奨）", type="password", key="reg_pw")
+                submitted = st.form_submit_button("新規登録", use_container_width=True)
+                if submitted:
+                    try:
+                        u = _auth.create_user(account_id=account_id, password=password, display_name=display_name)
+                        st.success("登録完了！そのままログインします。")
+                        st.session_state["user"] = u.to_public_dict()
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e) or "登録に失敗しました")
+
+    # サイドバー上部にユーザー表示＆ログアウト
+    with st.sidebar:
+        if st.session_state["user"]:
+            u = st.session_state["user"]
+            st.markdown(f"**Signed in:** {u.get('display_name') or u['account_id']}")
+            if st.button("ログアウト", use_container_width=True):
+                st.session_state["user"] = None
+                st.success("ログアウトしました")
+                st.rerun()
+
+def require_user():
+    """ログイン必須。未ログインならサイドバーUIを表示して停止。"""
+    _render_auth_sidebar()
+    if not st.session_state["user"]:
+        st.info("左のサイドバーからログイン／登録してください。")
+        st.stop()
+    return st.session_state["user"]
+
+# ここでユーザー必須にする（下の本体ロジックは必ずログイン後に動く）
+_current_user = require_user()
+USER_ID = _current_user["id"]                  # 数値ID
+USER_ACCOUNT = _current_user["account_id"]     # 文字列ユーザーID
+USER_NAME = _current_user.get("display_name") or USER_ACCOUNT
+# === 挨拶メッセージ ===
+import datetime as dt
+now_hour = dt.datetime.now().hour
+if now_hour < 12:
+    greeting = "おはようございます"
+elif now_hour < 18:
+    greeting = "こんにちは"
+else:
+    greeting = "こんばんは"
+
+st.markdown(f"### {greeting}、{USER_NAME} さん！")
+
+# ======================================================================
+
 
  # --- DEVメッセージ制御（ユーザーに見せない） ---
 def _get_query_params_safe():
@@ -159,6 +245,7 @@ if st.button("🧹 通算をリセット", help="回をまたいだ講評履歴�
     st.session_state.history_items = []
     st.success("通算データをリセットしました。")
 
+
 # --- 見た目調整（黒文字＆引用ブロック） ---
 st.markdown("""
 <style>
@@ -228,11 +315,11 @@ def domain_tagset(domain_label: str) -> Set[str]:
     else:  # 日常
         return {"daily", "日常", "friend", "family", "生活", "home", "communication"}
 
-def filter_by_domain_strict(qs, domain_label: str, want: int) -> List:
+def filter_by_domain_strict(qs, domain_label: str) -> List:
     """タグ一致のみ採用（越境補充なし）"""
     pref = domain_tagset(domain_label)
-    matched = [q for q in qs if any(t in pref for t in (q.tags or []))]
-    return matched[:want]
+    return [q for q in qs if any(t in pref for t in (q.tags or []))]
+
 
 def render_prompt_block(text: str):
     """会話や長文を読みやすく描画（引用＋改行維持、A:/B:の前に空行）"""
@@ -376,7 +463,8 @@ def get_new_batch(_skill: str, _domain: str, want: int = 2):
         candidates = [q for q in candidates if q.type != "sjt"]
 
     # ドメイン厳格フィルタ（越境補充なし）
-    domain_candidates = filter_by_domain_strict(candidates, _domain, want=want)
+    domain_candidates = filter_by_domain_strict(candidates, _domain)
+
 
     # 未出題のみを pick
     seen = st.session_state.get("seen_ids", set())
@@ -713,6 +801,25 @@ if not is_sjt_mode:
 st.session_state._graded = True
 st.session_state._ai_summary = None
 st.session_state._ai_summary_total = None
+# --- 通算スコア（MCQのみ）インライン表示：採点ボタン ↔ AI講評ボタン の間 ---
+def _render_total_score_inline():
+    hist = st.session_state.get("history_items", [])
+    # MCQで正誤が判定されたもののみ集計（未回答は除外）
+    mcq_items = [
+        it for it in hist
+        if (it or {}).get("type") == "mcq" and isinstance((it or {}).get("correct"), bool)
+    ]
+    total = len(mcq_items)
+    correct = sum(1 for it in mcq_items if it.get("correct") is True)
+
+    if total > 0:
+        pct = round(100 * correct / total)
+        with st.container(border=True):
+            st.markdown(f"**📈 通算スコア**：{correct} / {total}（{pct}%）")
+    else:
+        st.caption("📈 通算スコア：まだMCQの記録はありません")
+
+_render_total_score_inline()
 
 # ボタン押下時のみAI講評を生成・表示
 if (not is_sjt_mode) and st.session_state.get("history_items") and st.button(
