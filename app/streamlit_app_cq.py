@@ -136,6 +136,24 @@ _ensure_db()
 # --- ページ設定 ---
 st.set_page_config(page_title="CQ App (MVP)", page_icon="🎧", layout="centered")
 st.title("🎧 CQ アプリ（MVP）")
+# --- Lottie: 初回だけ極小サイズでウォームアップ（Cloudの初回2秒ラグ対策） ---
+try:
+    if not st.session_state.get("_lottie_warmed", False):
+        # _LOTTIE は show_praise_card 用のキャッシュ(dict)。未定義でも安全にスキップ。
+        data_any = None
+        try:
+            data_any = next(iter(_LOTTIE.values())) if '_LOTTIE' in globals() else None
+        except Exception:
+            data_any = None
+
+        if data_any:
+            # 目に入らない高さで一度だけ描画→ランタイムとJSONをクライアント側にプリロード
+            from streamlit_lottie import st_lottie
+            st_lottie(data_any, height=1, key="lottie_warmup")
+        st.session_state["_lottie_warmed"] = True
+except Exception:
+    pass
+
 # ▼通算リセットボタン
 if st.button("🧹 通算をリセット", help="回をまたいだ講評履歴を消去します"):
     st.session_state.history_items = []
